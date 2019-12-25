@@ -28,13 +28,13 @@
 
 #if TUSB_OPT_DEVICE_ENABLED && CFG_TUSB_MCU == OPT_MCU_SAMD51
 
-#include "device/dcd.h"
 #include "sam.h"
+#include "device/dcd.h"
 
 /*------------------------------------------------------------------*/
 /* MACRO TYPEDEF CONSTANT ENUM
  *------------------------------------------------------------------*/
-static UsbDeviceDescBank sram_registers[8][2];
+static TU_ATTR_ALIGNED(4) UsbDeviceDescBank sram_registers[8][2];
 static TU_ATTR_ALIGNED(4) uint8_t _setup_packet[8];
 
 // Setup the control endpoint 0.
@@ -69,7 +69,7 @@ void dcd_init (uint8_t rhport)
 
   USB->DEVICE.PADCAL.bit.TRANSP = (*((uint32_t*) USB_FUSES_TRANSP_ADDR) & USB_FUSES_TRANSP_Msk) >> USB_FUSES_TRANSP_Pos;
   USB->DEVICE.PADCAL.bit.TRANSN = (*((uint32_t*) USB_FUSES_TRANSN_ADDR) & USB_FUSES_TRANSN_Msk) >> USB_FUSES_TRANSN_Pos;
-  USB->DEVICE.PADCAL.bit.TRIM = (*((uint32_t*) USB_FUSES_TRIM_ADDR) & USB_FUSES_TRIM_Msk) >> USB_FUSES_TRIM_Pos;
+  USB->DEVICE.PADCAL.bit.TRIM   = (*((uint32_t*) USB_FUSES_TRIM_ADDR) & USB_FUSES_TRIM_Msk) >> USB_FUSES_TRIM_Pos;
 
   USB->DEVICE.QOSCTRL.bit.CQOS = 3;
   USB->DEVICE.QOSCTRL.bit.DQOS = 3;
@@ -81,7 +81,7 @@ void dcd_init (uint8_t rhport)
   while (USB->DEVICE.SYNCBUSY.bit.ENABLE == 1) {}
 
   USB->DEVICE.INTFLAG.reg |= USB->DEVICE.INTFLAG.reg; // clear pending
-  USB->DEVICE.INTENSET.reg = USB_DEVICE_INTENSET_SOF | USB_DEVICE_INTENSET_EORST;
+  USB->DEVICE.INTENSET.reg = /* USB_DEVICE_INTENSET_SOF | */ USB_DEVICE_INTENSET_EORST;
 }
 
 void dcd_int_enable(uint8_t rhport)
@@ -104,13 +104,13 @@ void dcd_int_disable(uint8_t rhport)
 
 void dcd_set_address (uint8_t rhport, uint8_t dev_addr)
 {
-  // Response with status first before changing device address
-  dcd_edpt_xfer(rhport, tu_edpt_addr(0, TUSB_DIR_IN), NULL, 0);
+  (void) dev_addr;
 
-  // Wait for EP0 to finish before switching the address.
-  while (USB->DEVICE.DeviceEndpoint[0].EPSTATUS.bit.BK1RDY == 1) {}
+  // Response with zlp status
+  dcd_edpt_xfer(rhport, 0x80, NULL, 0);
 
-  USB->DEVICE.DADD.reg = USB_DEVICE_DADD_DADD(dev_addr) | USB_DEVICE_DADD_ADDEN;
+  // DCD can only set address after status for this request is complete
+  // do it at dcd_edpt0_status_complete()
 
   // Enable SUSPEND interrupt since the bus signal D+/D- are stable now.
   USB->DEVICE.INTFLAG.reg = USB_DEVICE_INTENCLR_SUSPEND; // clear pending
@@ -134,6 +134,22 @@ void dcd_remote_wakeup(uint8_t rhport)
 /*------------------------------------------------------------------*/
 /* DCD Endpoint port
  *------------------------------------------------------------------*/
+
+// Invoked when a control transfer's status stage is complete.
+// May help DCD to prepare for next control transfer, this API is optional.
+void dcd_edpt0_status_complete(uint8_t rhport, tusb_control_request_t const * request)
+{
+  if (request->bmRequestType_bit.recipient == TUSB_REQ_RCPT_DEVICE &&
+      request->bmRequestType_bit.type == TUSB_REQ_TYPE_STANDARD &&
+      request->bRequest == TUSB_REQ_SET_ADDRESS )
+  {
+    uint8_t const dev_addr = (uint8_t) request->wValue;
+    USB->DEVICE.DADD.reg = USB_DEVICE_DADD_DADD(dev_addr) | USB_DEVICE_DADD_ADDEN;
+  }
+
+  // Just finished status stage, prepare for next setup packet
+  dcd_edpt_xfer(rhport, 0x00, _setup_packet, sizeof(_setup_packet));
+}
 
 bool dcd_edpt_open (uint8_t rhport, tusb_desc_endpoint_t const * desc_edpt)
 {
@@ -241,7 +257,8 @@ static bool maybe_handle_setup_packet(void) {
     USB->DEVICE.DeviceEndpoint[0].EPINTFLAG.reg = USB_DEVICE_EPINTFLAG_RXSTP;
 
     // This copies the data elsewhere so we can reuse the buffer.
-    dcd_event_setup_received(0, (uint8_t*) sram_registers[0][0].ADDR.reg, true);
+    dcd_event_setup_received(0, _setup_packet, true);
+
     return true;
   }
   return false;
@@ -320,11 +337,7 @@ void transfer_complete(uint8_t direction) {
       continue;
     }
 
-    if (direction == TUSB_DIR_OUT && maybe_handle_setup_packet()) {
-      continue;
-    }
     UsbDeviceEndpoint* ep = &USB->DEVICE.DeviceEndpoint[epnum];
-
     UsbDeviceDescBank* bank = &sram_registers[epnum][direction];
     uint16_t total_transfer_size = bank->PCKSIZE.bit.BYTE_COUNT;
 
@@ -333,11 +346,6 @@ void transfer_complete(uint8_t direction) {
       ep_addr |= TUSB_DIR_IN_MASK;
     }
     dcd_event_xfer_complete(0, ep_addr, total_transfer_size, XFER_RESULT_SUCCESS, true);
-
-    // just finished status stage (total size = 0), prepare for next setup packet
-    if (epnum == 0 && total_transfer_size == 0) {
-      dcd_edpt_xfer(0, 0, _setup_packet, sizeof(_setup_packet));
-    }
 
     if (direction == TUSB_DIR_IN) {
       ep->EPINTFLAG.reg = USB_DEVICE_EPINTFLAG_TRCPT1;
